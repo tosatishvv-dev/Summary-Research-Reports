@@ -6,6 +6,7 @@ echo The app will open in your default browser at http://localhost:4000 in a few
 start cmd /c "timeout /t 4 /nobreak >nul & start http://localhost:4000"
 
 :: Start the application
+set LOCAL_PORT=4000
 npm run dev
 
 pause

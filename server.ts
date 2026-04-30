@@ -173,7 +173,8 @@ console.log('✅ SQLite Database initialized: intelligence.db');
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  // AI Studio requires port 3000, but you can override this locally using LOCAL_PORT in your .env
+  const PORT = process.env.LOCAL_PORT || 3000;
 
   app.use(express.json());
 
