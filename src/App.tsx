@@ -233,7 +233,7 @@ export default function App() {
         config.responseSchema = schema;
       }
       const res = await fallbackAi.models.generateContent({
-        model: "gemini-3.1-pro-preview",
+        model: "gemini-2.5-flash",
         contents: prompt,
         config: Object.keys(config).length > 0 ? config : undefined
       });
@@ -251,7 +251,7 @@ export default function App() {
           config.responseSchema = schema;
         }
         const res = await currentAi.models.generateContent({
-          model: "gemini-3.1-pro-preview",
+          model: "gemini-2.5-flash",
           contents: prompt,
           config: Object.keys(config).length > 0 ? config : undefined
         });
@@ -3286,7 +3286,7 @@ Long-term investors are focusing on quality and defensive sectors in an environm
                             setIsAddingKey(true);
                             try {
                               const testAi = new GoogleGenAI({ apiKey: newKeyValue });
-                              await testAi.models.generateContent({ model: "gemini-3.1-pro-preview", contents: "test" });
+                              await testAi.models.generateContent({ model: "gemini-2.5-flash", contents: "test" });
                               
                               const res = await fetch('/api/keys', {
                                 method: 'POST',
