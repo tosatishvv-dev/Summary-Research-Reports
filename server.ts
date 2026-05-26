@@ -70,6 +70,13 @@ db.exec(`
     instruction TEXT,
     label TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS custom_refinements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instruction TEXT NOT NULL UNIQUE,
+    elaborated_prompt TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 // Migration: Add is_deleted column if it doesn't exist (for existing databases)
@@ -123,6 +130,28 @@ try {
     console.log('Migrating categories table: adding parent_id column');
     db.exec("ALTER TABLE categories ADD COLUMN parent_id INTEGER REFERENCES categories(id)");
   }
+  if (!categoriesInfo.some(col => col.name === 'header_text')) {
+    console.log('Migrating categories table: adding header_text column');
+    db.exec("ALTER TABLE categories ADD COLUMN header_text TEXT");
+  }
+  if (!categoriesInfo.some(col => col.name === 'footer_text')) {
+    console.log('Migrating categories table: adding footer_text column');
+    db.exec("ALTER TABLE categories ADD COLUMN footer_text TEXT");
+  }
+  if (!categoriesInfo.some(col => col.name === 'is_header_active')) {
+    console.log('Migrating categories table: adding is_header_active column');
+    db.exec("ALTER TABLE categories ADD COLUMN is_header_active INTEGER DEFAULT 0");
+  }
+  if (!categoriesInfo.some(col => col.name === 'is_footer_active')) {
+    console.log('Migrating categories table: adding is_footer_active column');
+    db.exec("ALTER TABLE categories ADD COLUMN is_footer_active INTEGER DEFAULT 0");
+  }
+
+  const refinementsInfo = db.prepare("PRAGMA table_info(custom_refinements)").all() as any[];
+  if (!refinementsInfo.some(col => col.name === 'elaborated_prompt')) {
+    console.log('Migrating custom_refinements table: adding elaborated_prompt column');
+    db.exec("ALTER TABLE custom_refinements ADD COLUMN elaborated_prompt TEXT");
+  }
 
   // Reset exhausted keys at midnight
   const resetExhaustedKeys = () => {
@@ -168,6 +197,22 @@ insertPrompt.run('addon_sentiment', '- Analyze market sentiment (Bullish/Bearish
 insertPrompt.run('addon_figures', '- Extract and list all key prices, percentages, and figures mentioned.', 'Add-on: Key Figures');
 insertPrompt.run('addon_impact', '- Add an "Impact Analysis" section explaining why this news matters for the market.', 'Add-on: Impact Analysis');
 insertPrompt.run('addon_tags', '- Generate 3-5 relevant search tags/hashtags.', 'Add-on: Search Tags');
+
+// Seed initial custom refinement instructions if empty
+try {
+  const refinementCount = db.prepare('SELECT count(*) as count FROM custom_refinements').get() as { count: number };
+  if (refinementCount.count === 0) {
+    const insertRefinement = db.prepare('INSERT OR IGNORE INTO custom_refinements (instruction) VALUES (?)');
+    [
+      'Make it punchy and short',
+      'Focus on price levels and key resist/support figures',
+      'Summarize key global and domestic events only'
+    ].forEach(instr => insertRefinement.run(instr));
+    console.log('Seeded initial custom refinements.');
+  }
+} catch (e) {
+  console.error('Failed to seed custom refinements:', e);
+}
 
 console.log('✅ SQLite Database initialized: intelligence.db');
 
@@ -292,6 +337,50 @@ async function startServer() {
     }
   });
 
+  // Edit an existing category
+  app.patch('/api/categories/:id', (req, res) => {
+    const id = req.params.id;
+    const { name, header_text, footer_text, is_header_active, is_footer_active } = req.body;
+    
+    try {
+      const updates: string[] = [];
+      const values: any[] = [];
+      
+      if (name !== undefined) { updates.push('name = ?'); values.push(name); }
+      if (header_text !== undefined) { updates.push('header_text = ?'); values.push(header_text); }
+      if (footer_text !== undefined) { updates.push('footer_text = ?'); values.push(footer_text); }
+      if (is_header_active !== undefined) { updates.push('is_header_active = ?'); values.push(is_header_active ? 1 : 0); }
+      if (is_footer_active !== undefined) { updates.push('is_footer_active = ?'); values.push(is_footer_active ? 1 : 0); }
+      
+      if (updates.length === 0) return res.json({ status: 'no changes' });
+      
+      values.push(id);
+      console.log(`Updating category id ${id} with:`, { name, header_text, footer_text, is_header_active, is_footer_active });
+      const stmt = db.prepare(`UPDATE categories SET ${updates.join(', ')} WHERE id = ?`);
+      const result = stmt.run(...values);
+      console.log(`Category update result for id ${id}:`, result);
+      
+      res.json({ id: Number(id), status: 'updated' });
+    } catch (error: any) {
+      console.error('Failed to update category in database:', error);
+      res.status(500).json({ error: 'Failed to update category', details: error?.message || String(error) });
+    }
+  });
+
+  // Get multiple categories
+  app.get('/api/news/multi', (req, res) => {
+    const idsString = req.query.ids as string;
+    if (!idsString) return res.json([]);
+    const ids = idsString.split(',').map(n => parseInt(n, 10)).filter(n => !isNaN(n));
+    if (ids.length === 0) return res.json([]);
+    
+    // SQLite limits parameters, but practically it's fine for small lists
+    const placeholders = ids.map(() => '?').join(',');
+    const stmt = db.prepare(`SELECT * FROM news WHERE category_id IN (${placeholders}) AND is_deleted = 0 ORDER BY created_at DESC`);
+    const news = stmt.all(...ids);
+    res.json(news);
+  });
+
   // Get all news for a specific category ID
   app.get('/api/news/:categoryId', (req, res) => {
     const { categoryId } = req.params;
@@ -403,6 +492,20 @@ async function startServer() {
       console.error('Failed to save report:', error);
       res.status(500).json({ error: "Failed to save report" });
     }
+  });
+
+  // Get all reports for multiple categories
+  app.get('/api/reports/multi', (req, res) => {
+    const idsString = req.query.ids as string;
+    if (!idsString) return res.json([]);
+    const ids = idsString.split(',').map(n => parseInt(n, 10)).filter(n => !isNaN(n));
+    if (ids.length === 0) return res.json([]);
+    
+    // SQLite limits parameters, but practically it's fine for small lists
+    const placeholders = ids.map(() => '?').join(',');
+    const stmt = db.prepare(`SELECT * FROM reports WHERE category_id IN (${placeholders}) AND is_deleted = 0 ORDER BY created_at DESC`);
+    const reports = stmt.all(...ids);
+    res.json(reports);
   });
 
   // Get all reports for a category ID
@@ -526,6 +629,83 @@ async function startServer() {
     }
   });
 
+  // --- Custom Refinement Instructions Endpoints ---
+  app.get('/api/custom-refinements', (req, res) => {
+    try {
+      const refinements = db.prepare('SELECT * FROM custom_refinements ORDER BY id DESC').all();
+      res.json(refinements);
+    } catch (error: any) {
+      res.status(500).json({ error: 'Failed to fetch custom refinements', details: error.message });
+    }
+  });
+
+  app.post('/api/custom-refinements', (req, res) => {
+    const { instruction, elaborated_prompt } = req.body;
+    if (!instruction || !instruction.trim()) {
+      return res.status(400).json({ error: 'Instruction text is required' });
+    }
+    try {
+      const stmt = db.prepare('INSERT INTO custom_refinements (instruction, elaborated_prompt) VALUES (?, ?)');
+      const info = stmt.run(instruction.trim(), elaborated_prompt ? elaborated_prompt.trim() : null);
+      res.json({ 
+        id: info.lastInsertRowid, 
+        instruction: instruction.trim(), 
+        elaborated_prompt: elaborated_prompt ? elaborated_prompt.trim() : null, 
+        status: 'created' 
+      });
+    } catch (error: any) {
+      if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        return res.status(400).json({ error: 'This custom instruction already exists' });
+      }
+      res.status(500).json({ error: 'Failed to create custom refinement', details: error.message });
+    }
+  });
+
+  app.put('/api/custom-refinements/:id', (req, res) => {
+    const { id } = req.params;
+    const { instruction, elaborated_prompt } = req.body;
+    
+    // Allow updating instruction, elaborated_prompt, or both. At least one is required.
+    if ((instruction === undefined || instruction === null || !instruction.trim()) && (elaborated_prompt === undefined)) {
+      return res.status(400).json({ error: 'At least instruction or elaborated_prompt is required' });
+    }
+
+    try {
+      if (instruction !== undefined && elaborated_prompt !== undefined) {
+        db.prepare('UPDATE custom_refinements SET instruction = ?, elaborated_prompt = ? WHERE id = ?').run(
+          instruction.trim(), 
+          elaborated_prompt ? elaborated_prompt.trim() : null, 
+          id
+        );
+      } else if (instruction !== undefined) {
+        db.prepare('UPDATE custom_refinements SET instruction = ? WHERE id = ?').run(instruction.trim(), id);
+      } else if (elaborated_prompt !== undefined) {
+        db.prepare('UPDATE custom_refinements SET elaborated_prompt = ? WHERE id = ?').run(
+          elaborated_prompt ? elaborated_prompt.trim() : null, 
+          id
+        );
+      }
+      
+      const updatedRow = db.prepare('SELECT * FROM custom_refinements WHERE id = ?').get(id) as any;
+      res.json({ id: Number(id), ...updatedRow, status: 'updated' });
+    } catch (error: any) {
+      if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        return res.status(400).json({ error: 'This custom instruction already exists' });
+      }
+      res.status(500).json({ error: 'Failed to update custom refinement', details: error.message });
+    }
+  });
+
+  app.delete('/api/custom-refinements/:id', (req, res) => {
+    const { id } = req.params;
+    try {
+      db.prepare('DELETE FROM custom_refinements WHERE id = ?').run(id);
+      res.json({ id: Number(id), status: 'deleted' });
+    } catch (error: any) {
+      res.status(500).json({ error: 'Failed to delete custom refinement', details: error.message });
+    }
+  });
+
   // --- Vite Middleware ---
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
@@ -541,7 +721,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  app.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`🚀 Server running on http://localhost:${PORT}`);
   });
 }
