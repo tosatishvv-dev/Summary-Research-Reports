@@ -10,7 +10,7 @@ node -v >nul 2>&1
 if %errorlevel% neq 0 (
     echo [ERROR] Node.js is not installed on this system!
     echo.
-    echo Please install NodeJS (Recommended Version: 20 LTS or 22 LTS).
+    echo Please install NodeJS - Recommended Version 20 LTS or 22 LTS.
     echo You can download it from: https://nodejs.org/
     echo.
     echo Press any key to open the Node.js website and exit...
