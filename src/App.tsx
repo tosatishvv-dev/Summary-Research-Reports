@@ -4262,21 +4262,6 @@ Long-term investors are focusing on quality and defensive sectors in an environm
             }`}
           >
             <div className="flex items-center space-x-2">
-              <select
-                value={demoDaysAgo}
-                onChange={(e) =>
-                  setDemoDaysAgo(parseInt(e.target.value))
-                }
-                className="bg-transparent text-[10px] font-bold text-[#009f75] outline-none cursor-pointer pr-1"
-                title="Days Ago"
-              >
-                {[...Array(31)].map((_, i) => (
-                  <option key={i} value={i}>
-                    {i === 0 ? "Today" : i + "d ago"}
-                  </option>
-                ))}
-              </select>
-              <div className="w-[1px] h-3 bg-gray-300" />
               <input
                 type="file"
                 id={`main-image-upload-${location}`}
@@ -4303,17 +4288,6 @@ Long-term investors are focusing on quality and defensive sectors in an environm
               </button>
             </div>
             <div className="flex items-center space-x-2">
-              <button
-                type="button"
-                onClick={handleAddDemoNews}
-                disabled={isProcessing}
-                className={`p-1 rounded text-gray-400 hover:text-[#00df95] transition-colors disabled:opacity-50 ${
-                  theme === "dark" ? "hover:bg-[#009f75]/10" : "hover:bg-[#ebf5f1]"
-                }`}
-                title="Add Demo News"
-              >
-                <Database size={14} />
-              </button>
               <button
                 type="button"
                 onClick={handleProcess}
