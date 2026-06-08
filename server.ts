@@ -1,8 +1,10 @@
+import 'dotenv/config';
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
+import { GoogleGenAI } from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,7 +27,9 @@ db.exec(`
     summary_hi TEXT,
     is_copied INTEGER DEFAULT 0,
     is_deleted INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    refine_options TEXT,
+    correction_history TEXT
   );
 
   CREATE TABLE IF NOT EXISTS reports (
@@ -77,6 +81,12 @@ db.exec(`
     elaborated_prompt TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   );
+
+  CREATE TABLE IF NOT EXISTS criteria (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
 `);
 
 // Migration: Add is_deleted column if it doesn't exist (for existing databases)
@@ -101,6 +111,18 @@ try {
   if (!newsInfo.some(col => col.name === 'is_copied')) {
     console.log('Migrating news table: adding is_copied column');
     db.exec("ALTER TABLE news ADD COLUMN is_copied INTEGER DEFAULT 0");
+  }
+  if (!newsInfo.some(col => col.name === 'criteria_id')) {
+    console.log('Migrating news table: adding criteria_id column');
+    db.exec("ALTER TABLE news ADD COLUMN criteria_id INTEGER REFERENCES criteria(id)");
+  }
+  if (!newsInfo.some(col => col.name === 'refine_options')) {
+    console.log('Migrating news table: adding refine_options column');
+    db.exec("ALTER TABLE news ADD COLUMN refine_options TEXT");
+  }
+  if (!newsInfo.some(col => col.name === 'correction_history')) {
+    console.log('Migrating news table: adding correction_history column');
+    db.exec("ALTER TABLE news ADD COLUMN correction_history TEXT");
   }
 
   const reportsInfo = db.prepare("PRAGMA table_info(reports)").all() as any[];
@@ -171,6 +193,32 @@ try {
   };
   resetExhaustedKeys();
 
+  // Startup Healy Migration: re-assign news / reports saved under parent container categories to first child subcategories
+  try {
+    console.log('Running startup database healing for parent category assignments...');
+    const parents = db.prepare("SELECT id FROM categories WHERE parent_id IS NULL").all() as any[];
+    for (const pr of parents) {
+      const firstChild = db.prepare("SELECT id, name FROM categories WHERE parent_id = ? ORDER BY id ASC LIMIT 1").get(pr.id) as any;
+      if (firstChild) {
+        // Heal news table
+        const updateNews = db.prepare("UPDATE news SET category_id = ?, category = ? WHERE category_id = ?");
+        const newsResult = updateNews.run(firstChild.id, firstChild.name, pr.id);
+        if (newsResult.changes > 0) {
+          console.log(`Healed ${newsResult.changes} news items from parent ID ${pr.id} to child ID ${firstChild.id} (${firstChild.name})`);
+        }
+
+        // Heal reports table
+        const updateReports = db.prepare("UPDATE reports SET category_id = ?, category = ? WHERE category_id = ?");
+        const reportsResult = updateReports.run(firstChild.id, firstChild.name, pr.id);
+        if (reportsResult.changes > 0) {
+          console.log(`Healed ${reportsResult.changes} report items from parent ID ${pr.id} to child ID ${firstChild.id} (${firstChild.name})`);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Failed to run parent category database healing migration:', err);
+  }
+
 } catch (e) {
   console.error('Migration failed:', e);
 }
@@ -189,7 +237,7 @@ insertPrompt.run('lang_en', 'Provide English only.', 'Language: English');
 insertPrompt.run('lang_hi', 'Provide Hindi only. You MUST output native, grammatically correct Devanagari script. DO NOT output hallucinated gibberish or broken characters.', 'Language: Hindi');
 insertPrompt.run('lang_both', 'Provide both English and Hindi. For Hindi, you MUST output native, grammatically correct Devanagari script. DO NOT output hallucinated gibberish or broken characters.', 'Language: Both');
 insertPrompt.run('format_paragraph', 'Write as a cohesive paragraph.', 'Format: Paragraph');
-insertPrompt.run('format_bullets', 'OUTPUT STRICTLY AS A BULLETED LIST. Every single point MUST begin with a dash (-). Absolutely NO paragraphs.', 'Format: Bullets');
+insertPrompt.run('format_bullets', 'STRICTLY FORMAT AS A BULLETED LIST. Every single sentence, point, or distinct idea MUST be on its own separate line and MUST begin with the markdown dash character \"-\" followed by a space. DO NOT use the dot character \"•\". NEVER use paragraphs. This formatting MUST be perfectly applied to BOTH English and Hindi versions.', 'Format: Bullets');
 insertPrompt.run('length_short', 'Very short and concise.', 'Length: Very Short');
 insertPrompt.run('length_medium', 'Medium length, balanced detail.', 'Length: Medium');
 insertPrompt.run('length_long', 'Normal length, comprehensive.', 'Length: Normal');
@@ -214,14 +262,96 @@ try {
   console.error('Failed to seed custom refinements:', e);
 }
 
+// Seed initial criteria (Daily Closing, Weekly Closing)
+try {
+  const criteriaCount = db.prepare('SELECT count(*) as count FROM criteria').get() as { count: number };
+  if (criteriaCount.count === 0) {
+    const insertCriteria = db.prepare('INSERT OR IGNORE INTO criteria (name) VALUES (?)');
+    [
+      'Daily Closing',
+      'Weekly Closing'
+    ].forEach(name => insertCriteria.run(name));
+    console.log('Seeded initial criteria.');
+  }
+} catch (e) {
+  console.error('Failed to seed criteria:', e);
+}
+
 console.log('✅ SQLite Database initialized: intelligence.db');
 
 async function startServer() {
   const app = express();
-  // AI Studio requires port 3000, but you can override this locally using LOCAL_PORT in your .env
-  const PORT = process.env.LOCAL_PORT || 3000;
+  // AI Studio requires port 3000, but you can override this locally using LOCAL_PORT or PORT in your .env
+  const PORT = process.env.LOCAL_PORT || process.env.PORT || 3000;
 
   app.use(express.json());
+
+  app.post('/api/generate-image', async (req, res) => {
+    try {
+      const { prompt, api_key } = req.body;
+      if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
+      
+      const keyToUse = api_key || process.env.GEMINI_API_KEY;
+      if (!keyToUse) return res.status(400).json({ error: 'No API key available' });
+      
+      const currentAi = new GoogleGenAI({ apiKey: keyToUse });
+      const interaction = await currentAi.interactions.create({
+        model: 'gemini-2.5-flash-image',
+        input: prompt,
+        response_modalities: ['image', 'text'],
+        generation_config: { image_config: { aspect_ratio: "16:9", image_size: "1K" } },
+      });
+      for (const step of interaction.steps) {
+        if (step.type === 'model_output') {
+          const imageContent = step.content?.find(c => c.type === 'image');
+          if (imageContent && imageContent.data) {
+            return res.json({ image: `data:${imageContent.mime_type || 'image/png'};base64,${imageContent.data}` });
+          }
+        }
+      }
+      res.status(500).json({ error: 'No image generated by Gemini' });
+    } catch (e: any) {
+      console.error('Image generation error:', e);
+      res.status(500).json({ error: e.message || 'Image generation failed' });
+    }
+  });
+
+  app.post('/api/generate-text', async (req, res) => {
+    try {
+      const { prompt, schema, images, api_key, model } = req.body;
+      if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
+      
+      const keyToUse = api_key || process.env.GEMINI_API_KEY;
+      if (!keyToUse) return res.status(400).json({ error: 'No API key available' });
+      
+      const currentAi = new GoogleGenAI({ apiKey: keyToUse });
+      
+      const parts: any[] = [{ text: prompt }];
+      if (images && images.length > 0) {
+        images.forEach((img: any) => {
+          parts.push({ inlineData: { data: img.data, mimeType: img.mimeType } });
+        });
+      }
+
+      const config: any = {};
+      if (schema) {
+        config.responseMimeType = "application/json";
+        config.responseSchema = schema;
+      }
+
+      const modelToUse = model || "gemini-3.5-flash";
+      const aiResponse = await currentAi.models.generateContent({
+        model: modelToUse,
+        contents: [{ role: 'user', parts }],
+        config
+      });
+
+      res.json({ text: aiResponse.text });
+    } catch (e: any) {
+      console.error('Text generation error:', e);
+      res.status(500).json({ error: e.message || 'Text generation failed' });
+    }
+  });
 
   // --- API Routes ---
   
@@ -253,6 +383,18 @@ async function startServer() {
         return res.status(400).json({ error: 'This API key already exists' });
       }
       res.status(500).json({ error: 'Failed to add API key' });
+    }
+  });
+
+  app.post('/api/test-key', async (req, res) => {
+    const { api_key } = req.body;
+    if (!api_key) return res.status(400).json({ error: 'API Key is required' });
+    try {
+      const currentAi = new GoogleGenAI({ apiKey: api_key });
+      await currentAi.models.generateContent({ model: "gemini-2.5-flash", contents: "test" });
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(400).json({ error: e.message || 'Key validation failed' });
     }
   });
 
@@ -391,14 +533,24 @@ async function startServer() {
 
   // Save new news (raw or refined)
   app.post('/api/news', (req, res) => {
-    const { category_id, category_name, raw_text, type, parent_id, summary_en, summary_hi, created_at } = req.body;
+    let { category_id, category_name, raw_text, type, parent_id, summary_en, summary_hi, created_at, criteria_id, refine_options, correction_history } = req.body;
     if (!category_id || !raw_text) {
       return res.status(400).json({ error: 'category_id and raw_text are required' });
     }
     try {
+      // Map parent categories to their first subcategory
+      const catCheck = db.prepare('SELECT parent_id FROM categories WHERE id = ?').get(category_id) as any;
+      if (catCheck && catCheck.parent_id === null) {
+        const firstChild = db.prepare('SELECT id, name FROM categories WHERE parent_id = ? ORDER BY id ASC LIMIT 1').get(category_id) as any;
+        if (firstChild) {
+          category_id = firstChild.id;
+          category_name = firstChild.name;
+        }
+      }
+
       const stmt = db.prepare(`
-        INSERT INTO news (category_id, category, raw_text, type, parent_id, summary_en, summary_hi, created_at) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+        INSERT INTO news (category_id, category, raw_text, type, parent_id, summary_en, summary_hi, created_at, criteria_id, refine_options, correction_history) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?)
       `);
       const info = stmt.run(
         category_id, 
@@ -408,7 +560,10 @@ async function startServer() {
         parent_id || null,
         summary_en || null,
         summary_hi || null,
-        created_at || null
+        created_at || null,
+        criteria_id || null,
+        refine_options || null,
+        correction_history || null
       );
       res.json({ id: info.lastInsertRowid, status: 'saved' });
     } catch (error) {
@@ -417,10 +572,10 @@ async function startServer() {
     }
   });
 
-  // Update news with summary and translation
+  // Update news with summary, translation, or criteria
   app.patch('/api/news/:id', (req, res) => {
     const { id } = req.params;
-    const { summary_en, summary_hi, is_copied } = req.body;
+    const { summary_en, summary_hi, is_copied, criteria_id, refine_options, correction_history } = req.body;
     
     if (is_copied !== undefined) {
       const stmt = db.prepare('UPDATE news SET is_copied = ? WHERE id = ?');
@@ -428,9 +583,42 @@ async function startServer() {
       return res.json({ status: 'updated_copied_status' });
     }
 
-    const stmt = db.prepare('UPDATE news SET summary_en = ?, summary_hi = ? WHERE id = ?');
-    stmt.run(summary_en, summary_hi, id);
-    res.json({ status: 'updated' });
+    if (criteria_id !== undefined || summary_en !== undefined || summary_hi !== undefined || refine_options !== undefined || correction_history !== undefined) {
+      let query = 'UPDATE news SET ';
+      const updates = [];
+      const params = [];
+
+      if (summary_en !== undefined) {
+        updates.push('summary_en = ?');
+        params.push(summary_en);
+      }
+      if (summary_hi !== undefined) {
+        updates.push('summary_hi = ?');
+        params.push(summary_hi);
+      }
+      if (criteria_id !== undefined) {
+        updates.push('criteria_id = ?');
+        params.push(criteria_id);
+      }
+      if (refine_options !== undefined) {
+        updates.push('refine_options = ?');
+        params.push(refine_options);
+      }
+      if (correction_history !== undefined) {
+        updates.push('correction_history = ?');
+        params.push(correction_history);
+      }
+
+      query += updates.join(', ');
+      query += ' WHERE id = ?';
+      params.push(id);
+
+      const stmt = db.prepare(query);
+      stmt.run(...params);
+      return res.json({ status: 'updated' });
+    }
+
+    res.status(400).json({ error: 'No fields to update provided' });
   });
 
   // Update report copied status
@@ -470,8 +658,18 @@ async function startServer() {
 
   // Save a new report
   app.post('/api/reports', (req, res) => {
-    const { category_id, category_name, type, content_en, content_hi, start_date, end_date, source_news_ids, source_mode } = req.body;
+    let { category_id, category_name, type, content_en, content_hi, start_date, end_date, source_news_ids, source_mode } = req.body;
     try {
+      // Map parent categories to their first subcategory
+      const catCheck = db.prepare('SELECT parent_id FROM categories WHERE id = ?').get(category_id) as any;
+      if (catCheck && catCheck.parent_id === null) {
+        const firstChild = db.prepare('SELECT id, name FROM categories WHERE parent_id = ? ORDER BY id ASC LIMIT 1').get(category_id) as any;
+        if (firstChild) {
+          category_id = firstChild.id;
+          category_name = firstChild.name;
+        }
+      }
+
       const stmt = db.prepare(`
         INSERT INTO reports (category_id, category, type, content_en, content_hi, start_date, end_date, source_news_ids, source_mode)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -703,6 +901,181 @@ async function startServer() {
       res.json({ id: Number(id), status: 'deleted' });
     } catch (error: any) {
       res.status(500).json({ error: 'Failed to delete custom refinement', details: error.message });
+    }
+  });
+
+  // --- Criteria Management Endpoints ---
+  app.get('/api/criteria', (req, res) => {
+    try {
+      const criteria = db.prepare('SELECT * FROM criteria ORDER BY id ASC').all();
+      res.json(criteria);
+    } catch (error: any) {
+      res.status(500).json({ error: 'Failed to fetch criteria', details: error.message });
+    }
+  });
+
+  app.post('/api/criteria', (req, res) => {
+    const { name } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'Criteria name is required' });
+    }
+    try {
+      const stmt = db.prepare('INSERT INTO criteria (name) VALUES (?)');
+      const info = stmt.run(name.trim());
+      res.json({
+        id: info.lastInsertRowid,
+        name: name.trim(),
+        status: 'created'
+      });
+    } catch (error: any) {
+      if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        return res.status(400).json({ error: 'This criteria already exists' });
+      }
+      res.status(500).json({ error: 'Failed to create criteria', details: error.message });
+    }
+  });
+
+  app.put('/api/criteria/:id', (req, res) => {
+    const { id } = req.params;
+    const { name } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'Criteria name is required' });
+    }
+    try {
+      db.prepare('UPDATE criteria SET name = ? WHERE id = ?').run(name.trim(), id);
+      res.json({ id: Number(id), name: name.trim(), status: 'updated' });
+    } catch (error: any) {
+      if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        return res.status(400).json({ error: 'This criteria already exists' });
+      }
+      res.status(500).json({ error: 'Failed to update criteria', details: error.message });
+    }
+  });
+
+  app.delete('/api/criteria/:id', (req, res) => {
+    const { id } = req.params;
+    try {
+      // Set to null any news referencing this criteria
+      db.prepare('UPDATE news SET criteria_id = NULL WHERE criteria_id = ?').run(id);
+      db.prepare('DELETE FROM criteria WHERE id = ?').run(id);
+      res.json({ id: Number(id), status: 'deleted' });
+    } catch (error: any) {
+      res.status(500).json({ error: 'Failed to delete criteria', details: error.message });
+    }
+  });
+
+  // --- Reporting Endpoints ---
+  app.get('/api/reporting/counts', (req, res) => {
+    const { period, from, to, newsType, criteriaFilter, starred, starredIds } = req.query;
+    try {
+      const now = new Date();
+      let startDateStr: string | null = null;
+      let endDateStr: string | null = null;
+
+      function toSqliteDateTime(d: Date) {
+        const pad = (n: number) => String(n).padStart(2, '0');
+        return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+      }
+
+      const p = String(period || '1day').toLowerCase().replace(/\s+/g, '');
+      
+      if (p === '1day') {
+        const d = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+        startDateStr = toSqliteDateTime(d);
+      } else if (p === '1week') {
+        const d = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        startDateStr = toSqliteDateTime(d);
+      } else if (p === '2weeks' || p === '2week') {
+        const d = new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000);
+        startDateStr = toSqliteDateTime(d);
+      } else if (p === '3weeks' || p === '3week') {
+        const d = new Date(now.getTime() - 21 * 24 * 60 * 60 * 1000);
+        startDateStr = toSqliteDateTime(d);
+      } else if (p === '1month') {
+        const d = new Date();
+        d.setMonth(now.getMonth() - 1);
+        startDateStr = toSqliteDateTime(d);
+      } else if (p === '2months' || p === '2month') {
+        const d = new Date();
+        d.setMonth(now.getMonth() - 2);
+        startDateStr = toSqliteDateTime(d);
+      } else if (p === '3months' || p === '3month') {
+        const d = new Date();
+        d.setMonth(now.getMonth() - 3);
+        startDateStr = toSqliteDateTime(d);
+      } else if (p === '1year') {
+        const d = new Date();
+        d.setFullYear(now.getFullYear() - 1);
+        startDateStr = toSqliteDateTime(d);
+      } else if (p === '2years' || p === '2year') {
+        const d = new Date();
+        d.setFullYear(now.getFullYear() - 2);
+        startDateStr = toSqliteDateTime(d);
+      } else if (p === '3years' || p === '3year') {
+        const d = new Date();
+        d.setFullYear(now.getFullYear() - 3);
+        startDateStr = toSqliteDateTime(d);
+      } else if (p === 'custom') {
+        if (from) {
+          startDateStr = toSqliteDateTime(new Date(String(from)));
+        }
+        if (to) {
+          endDateStr = toSqliteDateTime(new Date(String(to)));
+        }
+      }
+
+      let query = 'SELECT category_id, COUNT(*) as count FROM news WHERE is_deleted = 0';
+      const params: any[] = [];
+
+      if (startDateStr) {
+        query += ' AND datetime(created_at) >= datetime(?)';
+        params.push(startDateStr);
+      }
+      if (endDateStr) {
+        query += ' AND datetime(created_at) <= datetime(?)';
+        params.push(endDateStr);
+      }
+
+      // Filter by news type (raw or refined)
+      if (newsType === 'raw' || newsType === 'refined') {
+        query += ' AND type = ?';
+        params.push(newsType);
+      }
+
+      // Filter by criteria
+      if (criteriaFilter === 'none') {
+        query += ' AND (criteria_id IS NULL OR criteria_id = 0 OR criteria_id = \'\')';
+      } else if (criteriaFilter && criteriaFilter !== 'all') {
+        const critId = Number(criteriaFilter);
+        if (!isNaN(critId)) {
+          query += ' AND criteria_id = ?';
+          params.push(critId);
+        }
+      }
+
+      // Filter by starred
+      if (starred === 'only') {
+        if (starredIds && typeof starredIds === 'string' && starredIds.trim().length > 0) {
+          const ids = starredIds.split(',').map(Number).filter(n => !isNaN(n));
+          if (ids.length > 0) {
+            const placeholders = ids.map(() => '?').join(',');
+            query += ` AND id IN (${placeholders})`;
+            params.push(...ids);
+          } else {
+            query += ' AND 1 = 0'; // No starred items, return 0 counts
+          }
+        } else {
+          query += ' AND 1 = 0'; // No starred items, return 0 counts
+        }
+      }
+
+      query += ' GROUP BY category_id';
+
+      const counts = db.prepare(query).all(...params) as { category_id: number | null, count: number }[];
+      res.json(counts);
+    } catch (error: any) {
+      console.error('Failed to query reporting counts:', error);
+      res.status(500).json({ error: 'Failed to retrieve reporting counts', details: error.message });
     }
   });
 
